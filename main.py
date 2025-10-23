@@ -7,22 +7,32 @@ import socket
 from datetime import datetime
 
 # -----------------------------
-# UDP CONFIGURATION
+# UDP NETWORK CONFIG
 # -----------------------------
-PC_IP = "192.168.1.100"   # 🔹 Change this to your PC's IP
-PC_PORT = 5005             # 🔹 Same as the receiver’s listening port
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setblocking(False)    # non-blocking (won’t freeze if no network)
+BROADCAST_PORT = 5006   # PC will broadcast on this port
+TRACKING_PORT = 5005    # Pi will send tracking data here
+DISCOVERY_TIMEOUT = 5.0 # seconds to wait before re-listening
+
+# UDP sockets
+broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+broadcast_sock.bind(("", BROADCAST_PORT))
+broadcast_sock.settimeout(DISCOVERY_TIMEOUT)
+
+send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+send_sock.setblocking(False)
+
+pc_ip = None
 
 # -----------------------------
-# EXISTING FUNCTIONS
+# TRACKING FUNCTIONS
 # -----------------------------
 def process_frame(frame, buffer, delay, alpha):
     inverted = 255 - frame
     buffer.append(inverted)
     if len(buffer) > delay:
-        delayed_inverted = buffer[-(delay+1)]
-        blended = cv2.addWeighted(frame, 1-alpha, delayed_inverted, alpha, 0)
+        delayed_inverted = buffer[-(delay + 1)]
+        blended = cv2.addWeighted(frame, 1 - alpha, delayed_inverted, alpha, 0)
     else:
         blended = frame
     return blended
@@ -38,9 +48,6 @@ def detect_pupil(motion_frame):
         return int(x), int(y)
     return None
 
-def nothing(x):
-    pass
-
 def write_latest_json(x, y):
     data = {"timestamp": time.time(), "x": x, "y": y}
     with open("outputs.json", "w") as f:
@@ -51,22 +58,39 @@ def append_log(x, y):
     with open("logs.txt", "a") as f:
         f.write(f"[{timestamp}] x={x}, y={y}\n")
 
-# -----------------------------
-# NEW: Send data via UDP
-# -----------------------------
 def send_udp_data(x, y):
+    if not pc_ip:
+        return
     payload = {"timestamp": time.time(), "x": x, "y": y}
-    message = json.dumps(payload).encode()
     try:
-        sock.sendto(message, (PC_IP, PC_PORT))
+        send_sock.sendto(json.dumps(payload).encode(), (pc_ip, TRACKING_PORT))
     except Exception:
-        # Ignore transient network errors
         pass
+
+# -----------------------------
+# DISCOVERY FUNCTION
+# -----------------------------
+def discover_pc():
+    """Listen for PC broadcast messages and return its IP."""
+    print("🔍 Waiting for PC broadcast...")
+    while True:
+        try:
+            data, addr = broadcast_sock.recvfrom(1024)
+            if data.decode().strip() == "PC_AVAILABLE":
+                print(f"✅ Found PC at {addr[0]}")
+                return addr[0]
+        except socket.timeout:
+            print("⌛ No broadcast received, still listening...")
+        except Exception as e:
+            print("Network error:", e)
+            time.sleep(1)
 
 # -----------------------------
 # MAIN LOOP
 # -----------------------------
 def main():
+    global pc_ip
+
     test_mode = True
     input_path = "1.mkv"    # set to None for webcam
     loop_video = True
@@ -81,11 +105,14 @@ def main():
     buffer = []
 
     cv2.namedWindow("Motion Extract + Pupil")
-    cv2.createTrackbar("Delay", "Motion Extract + Pupil", 2, 30, nothing)
-    cv2.createTrackbar("Opacity", "Motion Extract + Pupil", 23, 100, nothing)
-    cv2.createTrackbar("Speed", "Motion Extract + Pupil", 10, 50, nothing)
+    cv2.createTrackbar("Delay", "Motion Extract + Pupil", 2, 30, lambda x: None)
+    cv2.createTrackbar("Opacity", "Motion Extract + Pupil", 23, 100, lambda x: None)
+    cv2.createTrackbar("Speed", "Motion Extract + Pupil", 10, 50, lambda x: None)
 
     print("Starting pupil tracking... Press ESC to quit.")
+
+    # --- Auto-discover PC ---
+    pc_ip = discover_pc()
 
     while True:
         ret, frame = cap.read()
@@ -109,7 +136,7 @@ def main():
             cv2.circle(motion_frame, (x, y), 5, (0, 0, 255), -1)
             write_latest_json(x, y)
             append_log(x, y)
-            send_udp_data(x, y)  # 🔹 SEND OVER NETWORK HERE
+            send_udp_data(x, y)
 
             if not test_mode:
                 screen_w, screen_h = pyautogui.size()
@@ -122,7 +149,8 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
-    sock.close()
+    send_sock.close()
+    broadcast_sock.close()
 
 if __name__ == "__main__":
     main()
